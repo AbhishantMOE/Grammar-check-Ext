@@ -1,10 +1,10 @@
 // Chrome extension content script for Zendesk reply box grammar correction using Gemini API
-// -- FINAL VERSION v2: HIGHLIGHTING & FORMATTING PRESERVED --
+// -- FINAL VERSION: RELIABLE PREVIEW & FORMATTING --
 
 console.log("Gemini Assistant: Content script loaded.");
 
-// IMPORTANT: Replace with your actual API key.
-const API_KEY = "AIzaSyCzo4iMxp6l1BHLLkTcpRJ2WQ58DvCiVUc"; // <<<<<<< REMEMBER TO PUT YOUR KEY HERE
+// API Key and Model URL updated as per your request.
+const API_KEY = "AIzaSyCzo4iMxp6l1BHLLkTcpRJ2WQ58DvCiVUc";
 const GEMINI_API_URL =
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
 
@@ -21,31 +21,30 @@ const ZENDESK_EDITOR_SELECTOR =
 function createHighlightedPreview(originalHtml, correctedHtml) {
   const tempDiv = document.createElement("div");
 
-  // Get a set of original words for quick lookup
   tempDiv.innerHTML = originalHtml;
   const oldWords = new Set(
-    (tempDiv.innerText || "").split(/\s+/).filter((w) => w.length > 0)
+    (tempDiv.innerText || "")
+      .trim()
+      .split(/\s+/)
+      .filter((w) => w.length > 0)
   );
 
-  // Get an array of new words
   tempDiv.innerHTML = correctedHtml;
-  const newText = tempDiv.innerText || "";
+  const newText = (tempDiv.innerText || "").trim();
 
-  // Find words that are in the new text but not the old one
   const addedWords = new Set(
-    newText.split(/\s+/).filter((word) => !oldWords.has(word))
+    newText
+      .split(/\s+/)
+      .filter((word) => !oldWords.has(word) && word.length > 0)
   );
 
   if (addedWords.size === 0) {
-    return correctedHtml; // No changes to highlight
+    return correctedHtml;
   }
 
   let highlightedHtml = correctedHtml;
 
-  // Wrap each unique new word with a highlight span
   addedWords.forEach((word) => {
-    // Use a Regex to replace the word only when it's not part of an HTML tag.
-    // This looks for the word surrounded by boundaries (\b) and ensures it's not inside a tag.
     const regex = new RegExp(`\\b(${escapeRegExp(word)})\\b`, "gi");
     highlightedHtml = highlightedHtml.replace(
       regex,
@@ -56,7 +55,6 @@ function createHighlightedPreview(originalHtml, correctedHtml) {
   return highlightedHtml;
 }
 
-// Utility to escape strings for use in a Regular Expression
 function escapeRegExp(string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -128,14 +126,14 @@ function showPreviewBox(
 }
 
 /**
- * Sends HTML to the Gemini API for correction while preserving structure.
+ * Sends HTML to the Gemini API and robustly extracts the corrected HTML block.
  * @param {string} html The original HTML content from the editor.
- * @returns {Promise<string>} A promise that resolves to the corrected HTML string.
+ * @returns {Promise<string>} A promise that resolves to the clean, corrected HTML string.
  */
-async function correctWithGemini(html) {
+async function getCorrectionFromGemini(html) {
   if (!html || !html.trim()) return "";
 
-  const prompt = `You are a helpful grammar correction assistant. Below is a piece of HTML from a rich text editor. Correct the grammar and spelling of the text within the HTML tags. IMPORTANT: - Preserve the original HTML structure, including all <p> tags. - Your entire response must be only the corrected, raw HTML string. - Do NOT add any markdown like "\`\`\`html". Original HTML: --- ${html} ---`;
+  const prompt = `You are a helpful grammar correction assistant. Below is a piece of HTML from a rich text editor. Correct the grammar and spelling of the text within the HTML tags. IMPORTANT: - Preserve the original HTML structure, including all <p> tags. - Your entire response must be only the corrected, raw HTML string. - Do NOT add any markdown like "\`\`\`html" or conversational preamble. Original HTML: --- ${html} ---`;
 
   try {
     const response = await fetch(`${GEMINI_API_URL}?key=${API_KEY}`, {
@@ -149,15 +147,25 @@ async function correctWithGemini(html) {
     const data = await response.json();
 
     if (data?.candidates?.[0]?.content?.parts?.[0]?.text) {
-      let correctedText = data.candidates[0].content.parts[0].text.trim();
-      if (correctedText.startsWith("```html"))
-        correctedText = correctedText.substring(7);
-      if (correctedText.endsWith("```"))
-        correctedText = correctedText.slice(0, -3);
-      return correctedText.trim();
+      const rawResponse = data.candidates[0].content.parts[0].text.trim();
+      const firstTagIndex = rawResponse.search(/<[a-z][\s\S]*>/i);
+
+      if (firstTagIndex !== -1) {
+        const cleanedHtml = rawResponse.substring(firstTagIndex);
+        console.log(
+          "Gemini Assistant: Successfully extracted HTML block from response."
+        );
+        return cleanedHtml;
+      } else {
+        console.warn(
+          "Gemini Assistant: API response did not contain a valid HTML block.",
+          rawResponse
+        );
+        return html;
+      }
     } else {
       console.warn(
-        "Gemini Assistant: Received an invalid or empty response from the API.",
+        "Gemini Assistant: Received an invalid response structure from API.",
         JSON.stringify(data)
       );
       return html;
@@ -171,9 +179,6 @@ async function correctWithGemini(html) {
 
 /**
  * Main button click handler.
- * @param {Event} e The click event.
- * @param {HTMLElement} btn The button that was clicked.
- * @param {HTMLElement} editorElem The editor element.
  */
 async function onCorrectButtonClick(e, btn, editorElem) {
   e.preventDefault();
@@ -191,9 +196,15 @@ async function onCorrectButtonClick(e, btn, editorElem) {
   btn.disabled = true;
 
   const htmlToCorrect = editorElem.innerHTML;
-  const correctedHtml = await correctWithGemini(htmlToCorrect);
+  const correctedHtml = await getCorrectionFromGemini(htmlToCorrect);
 
-  if (correctedHtml === htmlToCorrect) {
+  const tempDiv = document.createElement("div");
+  tempDiv.innerHTML = htmlToCorrect;
+  const originalText = tempDiv.innerText.trim();
+  tempDiv.innerHTML = correctedHtml;
+  const correctedText = tempDiv.innerText.trim();
+
+  if (originalText === correctedText) {
     btn.textContent = "No Changes Needed";
     setTimeout(() => {
       btn.textContent = originalButtonText;
@@ -202,16 +213,12 @@ async function onCorrectButtonClick(e, btn, editorElem) {
     return;
   }
 
-  // Generate the special version of the HTML for the preview
   const previewHtml = createHighlightedPreview(htmlToCorrect, correctedHtml);
-
-  // Show the preview, passing both the preview and the clean versions
   showPreviewBox(previewHtml, correctedHtml, btn, editorElem);
 }
 
 /**
  * Creates and adds the "Correct" button to the editor's container.
- * @param {HTMLElement} editorElem The editable DOM element.
  */
 function addGeminiButton(editorElem) {
   if (!editorElem || editorElem.dataset.geminiButtonAdded) return;
@@ -286,12 +293,18 @@ function addGlobalStyles() {
   document.head.appendChild(style);
 }
 
-// --- SCRIPT EXECUTION ---
-addGlobalStyles();
-const observer = new MutationObserver(() =>
-  document.querySelectorAll(ZENDESK_EDITOR_SELECTOR).forEach(addGeminiButton)
-);
-observer.observe(document.body, { childList: true, subtree: true });
-window.addEventListener("load", () =>
-  document.querySelectorAll(ZENDESK_EDITOR_SELECTOR).forEach(addGeminiButton)
-);
+/**
+ * Main function to find and enhance all Zendesk editors.
+ */
+function initialize() {
+  addGlobalStyles();
+  const observer = new MutationObserver(() =>
+    document.querySelectorAll(ZENDESK_EDITOR_SELECTOR).forEach(addGeminiButton)
+  );
+  observer.observe(document.body, { childList: true, subtree: true });
+  window.addEventListener("load", () =>
+    document.querySelectorAll(ZENDESK_EDITOR_SELECTOR).forEach(addGeminiButton)
+  );
+}
+
+initialize();
