@@ -1,5 +1,5 @@
 // Chrome extension content script for Zendesk reply box grammar correction using Gemini API
-// -- FINAL VERSION: RELIABLE PREVIEW & FORMATTING --
+// -- FINAL, TESTED VERSION: RELIABLE FORMATTING & SPACING --
 
 console.log("Gemini Assistant: Content script loaded.");
 
@@ -12,8 +12,48 @@ const ZENDESK_EDITOR_SELECTOR =
   "[data-test-id='omnicomposer-rich-text-ckeditor']";
 
 /**
- * Compares original and corrected HTML to generate a new HTML string
- * with all new words highlighted in green.
+ * Converts editor HTML to plain text while correctly preserving paragraph and line breaks.
+ * @param {string} html The innerHTML of the editor.
+ * @returns {string} Plain text with paragraphs separated by a single newline.
+ */
+function convertHtmlToPlainText(html) {
+  const tempDiv = document.createElement("div");
+  tempDiv.innerHTML = html;
+  const paragraphs = tempDiv.querySelectorAll("p");
+  if (paragraphs.length === 0) {
+    // Fallback for content that doesn't use <p> tags
+    return (tempDiv.innerText || "").trim();
+  }
+  // Each <p> tag becomes a line. An empty <p> (like <p><br></p>) becomes an empty line.
+  // This preserves the exact structure.
+  return Array.from(paragraphs)
+    .map((p) => p.innerText.trim())
+    .join("\n");
+}
+
+/**
+ * Converts plain text with newlines back into a valid HTML string with <p> tags.
+ * @param {string} text Plain text with paragraphs separated by newlines.
+ * @returns {string} A string of HTML paragraphs.
+ */
+function convertPlainTextToHtml(text) {
+  if (!text || !text.trim()) return "<p><br></p>";
+  // Split by single newlines. Each line becomes a paragraph.
+  return text
+    .split("\n")
+    .map((line) => {
+      const trimmedLine = line.trim();
+      // If a line is empty, create a paragraph that will render as a blank line.
+      if (trimmedLine === "") {
+        return "<p><br></p>";
+      }
+      return `<p>${trimmedLine}</p>`;
+    })
+    .join("");
+}
+
+/**
+ * Compares original and corrected HTML to generate a new HTML string with highlights.
  * @param {string} originalHtml The original HTML from the editor.
  * @param {string} correctedHtml The corrected HTML from Gemini.
  * @returns {string} A new HTML string for the preview with highlights.
@@ -60,18 +100,12 @@ function escapeRegExp(string) {
 }
 
 /**
- * Shows a modal preview box.
- * @param {string} previewHtml The HTML with highlights to display.
- * @param {string} cleanCopyToClipboardHtml The non-highlighted HTML to be copied.
+ * Shows a modal preview box with a tabbed interface for different versions.
+ * @param {object} versions An object containing the HTML for each version.
  * @param {HTMLElement} mainButton The main "Correct" button on the page.
  * @param {HTMLElement} editorElem The editor element to focus on paste.
  */
-function showPreviewBox(
-  previewHtml,
-  cleanCopyToClipboardHtml,
-  mainButton,
-  editorElem
-) {
+function showPreviewBox(versions, mainButton, editorElem) {
   const existingOverlay = document.getElementById("gemini-preview-overlay");
   if (existingOverlay) existingOverlay.remove();
 
@@ -83,7 +117,16 @@ function showPreviewBox(
 
   previewBox.innerHTML = `
         <h3>Correction Preview</h3>
-        <div class="gemini-preview-content">${previewHtml}</div>
+        <div class="gemini-tab-buttons">
+            <button class="gemini-tab-button active" data-tab="fix">Fix Grammar</button>
+            <button class="gemini-tab-button" data-tab="elaborate">Elaborate</button>
+            <button class="gemini-tab-button" data-tab="shorten">Shorten</button>
+        </div>
+        <div class="gemini-tab-contents">
+            <div class="gemini-tab-content active" id="gemini-tab-content-fix">${versions.fix.previewHtml}</div>
+            <div class="gemini-tab-content" id="gemini-tab-content-elaborate">${versions.elaborate.previewHtml}</div>
+            <div class="gemini-tab-content" id="gemini-tab-content-shorten">${versions.shorten.previewHtml}</div>
+        </div>
         <div class="gemini-preview-actions">
             <button id="gemini-cancel-btn">Cancel</button>
             <button id="gemini-accept-btn">Accept & Copy</button>
@@ -99,14 +142,31 @@ function showPreviewBox(
     mainButton.classList.remove("ready-to-paste");
   };
 
+  const tabButtons = previewBox.querySelectorAll(".gemini-tab-button");
+  const tabContents = previewBox.querySelectorAll(".gemini-tab-content");
+  let activeTab = "fix";
+
+  tabButtons.forEach((button) => {
+    button.onclick = () => {
+      tabButtons.forEach((btn) => btn.classList.remove("active"));
+      tabContents.forEach((content) => content.classList.remove("active"));
+      button.classList.add("active");
+      activeTab = button.dataset.tab;
+      document
+        .getElementById(`gemini-tab-content-${activeTab}`)
+        .classList.add("active");
+    };
+  });
+
   document.getElementById("gemini-cancel-btn").onclick = () => {
     overlay.remove();
     resetMainButton();
   };
 
   document.getElementById("gemini-accept-btn").onclick = async () => {
+    const cleanHtmlToCopy = versions[activeTab].cleanHtml;
     try {
-      const blob = new Blob([cleanCopyToClipboardHtml], { type: "text/html" });
+      const blob = new Blob([cleanHtmlToCopy], { type: "text/html" });
       const clipboardItem = new ClipboardItem({ "text/html": blob });
       await navigator.clipboard.write([clipboardItem]);
 
@@ -126,15 +186,12 @@ function showPreviewBox(
 }
 
 /**
- * Sends HTML to the Gemini API and robustly extracts the corrected HTML block.
- * @param {string} html The original HTML content from the editor.
- * @returns {Promise<string>} A promise that resolves to the clean, corrected HTML string.
+ * Calls the Gemini API with a specific prompt (using plain text).
+ * @param {string} prompt The complete prompt to send.
+ * @param {string} originalText A fallback value in case of failure.
+ * @returns {Promise<string>} A promise that resolves to the clean, corrected plain text.
  */
-async function getCorrectionFromGemini(html) {
-  if (!html || !html.trim()) return "";
-
-  const prompt = `You are a helpful grammar correction assistant. Below is a piece of HTML from a rich text editor. Correct the grammar and spelling of the text within the HTML tags. IMPORTANT: - Preserve the original HTML structure, including all <p> tags. - Your entire response must be only the corrected, raw HTML string. - Do NOT add any markdown like "\`\`\`html" or conversational preamble. Original HTML: --- ${html} ---`;
-
+async function callGemini(prompt, originalText) {
   try {
     const response = await fetch(`${GEMINI_API_URL}?key=${API_KEY}`, {
       method: "POST",
@@ -147,33 +204,46 @@ async function getCorrectionFromGemini(html) {
     const data = await response.json();
 
     if (data?.candidates?.[0]?.content?.parts?.[0]?.text) {
-      const rawResponse = data.candidates[0].content.parts[0].text.trim();
-      const firstTagIndex = rawResponse.search(/<[a-z][\s\S]*>/i);
-
-      if (firstTagIndex !== -1) {
-        const cleanedHtml = rawResponse.substring(firstTagIndex);
-        console.log(
-          "Gemini Assistant: Successfully extracted HTML block from response."
-        );
-        return cleanedHtml;
-      } else {
-        console.warn(
-          "Gemini Assistant: API response did not contain a valid HTML block.",
-          rawResponse
-        );
-        return html;
-      }
-    } else {
-      console.warn(
-        "Gemini Assistant: Received an invalid response structure from API.",
-        JSON.stringify(data)
-      );
-      return html;
+      return data.candidates[0].content.parts[0].text.trim();
     }
+    return originalText;
   } catch (error) {
-    console.error("Gemini Assistant: Exception while contacting API.", error);
-    alert("Error contacting Gemini API. Check the console for details.");
-    return html;
+    console.error("Gemini Assistant: An API call failed.", error);
+    return originalText;
+  }
+}
+
+/**
+ * Gets three different corrected versions from the Gemini API using plain text.
+ * @param {string} text The original plain text from the editor.
+ * @returns {Promise<object>} A promise that resolves to an object with three corrected text versions.
+ */
+async function getCorrectionsFromGemini(text) {
+  if (!text || !text.trim()) return null;
+
+  const basePrompt = `IMPORTANT: - Preserve the paragraph breaks (represented by newlines) from the original text. - Your entire response must be ONLY the corrected text. Do not add any conversational preamble like "No problem" or markdown. Original Text: --- ${text} ---`;
+
+  const prompts = {
+    fix: `Correct the grammar and spelling in the following text. ${basePrompt}`,
+    elaborate: `Elaborate on the original text to make it more descriptive, professional, and detailed. Expand on the points, add context, and use richer vocabulary, but maintain the core message and all original paragraph breaks. Correct grammar and spelling. ${basePrompt}`,
+    shorten: `Shorten the original text to be more direct and concise. Remove filler words and redundant phrases, but ensure the key information, professional tone, and all original paragraph breaks are preserved. Correct grammar and spelling. ${basePrompt}`,
+  };
+
+  try {
+    const [fix, elaborate, shorten] = await Promise.all([
+      callGemini(prompts.fix, text),
+      callGemini(prompts.elaborate, text),
+      callGemini(prompts.shorten, text),
+    ]);
+
+    console.log(
+      "Gemini Assistant: All three plain text versions received from API."
+    );
+    return { fix, elaborate, shorten };
+  } catch (error) {
+    console.error("Gemini Assistant: Failed to get all corrections.", error);
+    alert("Error contacting Gemini API for all versions. Check the console.");
+    return { fix: text, elaborate: text, shorten: text };
   }
 }
 
@@ -195,17 +265,13 @@ async function onCorrectButtonClick(e, btn, editorElem) {
   btn.textContent = "⏳ Correcting...";
   btn.disabled = true;
 
-  const htmlToCorrect = editorElem.innerHTML;
-  const correctedHtml = await getCorrectionFromGemini(htmlToCorrect);
+  const originalHtml = editorElem.innerHTML;
+  const originalText = convertHtmlToPlainText(originalHtml);
 
-  const tempDiv = document.createElement("div");
-  tempDiv.innerHTML = htmlToCorrect;
-  const originalText = tempDiv.innerText.trim();
-  tempDiv.innerHTML = correctedHtml;
-  const correctedText = tempDiv.innerText.trim();
+  const correctedTextVersions = await getCorrectionsFromGemini(originalText);
 
-  if (originalText === correctedText) {
-    btn.textContent = "No Changes Needed";
+  if (!correctedTextVersions) {
+    btn.textContent = "Error";
     setTimeout(() => {
       btn.textContent = originalButtonText;
       btn.disabled = false;
@@ -213,8 +279,39 @@ async function onCorrectButtonClick(e, btn, editorElem) {
     return;
   }
 
-  const previewHtml = createHighlightedPreview(htmlToCorrect, correctedHtml);
-  showPreviewBox(previewHtml, correctedHtml, btn, editorElem);
+  // Convert all plain text versions back to clean HTML
+  const correctedHtmlVersions = {
+    fix: convertPlainTextToHtml(correctedTextVersions.fix),
+    elaborate: convertPlainTextToHtml(correctedTextVersions.elaborate),
+    shorten: convertPlainTextToHtml(correctedTextVersions.shorten),
+  };
+
+  // Prepare data for the preview box
+  const versionsForPreview = {
+    fix: {
+      cleanHtml: correctedHtmlVersions.fix,
+      previewHtml: createHighlightedPreview(
+        originalHtml,
+        correctedHtmlVersions.fix
+      ),
+    },
+    elaborate: {
+      cleanHtml: correctedHtmlVersions.elaborate,
+      previewHtml: createHighlightedPreview(
+        originalHtml,
+        correctedHtmlVersions.elaborate
+      ),
+    },
+    shorten: {
+      cleanHtml: correctedHtmlVersions.shorten,
+      previewHtml: createHighlightedPreview(
+        originalHtml,
+        correctedHtmlVersions.shorten
+      ),
+    },
+  };
+
+  showPreviewBox(versionsForPreview, btn, editorElem);
 }
 
 /**
@@ -247,7 +344,7 @@ function addGeminiButton(editorElem) {
 }
 
 /**
- * Injects the necessary CSS for the button and preview box into the page.
+ * Injects the necessary CSS for the button and the new tabbed preview box.
  */
 function addGlobalStyles() {
   if (document.getElementById("gemini-style-injector")) return;
@@ -268,10 +365,22 @@ function addGlobalStyles() {
       }
       #gemini-preview-box {
         background-color: white; border-radius: 12px; box-shadow: 0 5px 15px rgba(0,0,0,0.3);
-        width: 90%; max-width: 600px; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        width: 90%; max-width: 600px; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
         z-index: 99999; text-align: left;
       }
       #gemini-preview-box h3 { margin-top: 0; color: #333; }
+      .gemini-tab-buttons {
+        display: flex; border-bottom: 1px solid #ddd; margin-bottom: 15px;
+      }
+      .gemini-tab-button {
+        padding: 10px 15px; border: none; background-color: transparent; cursor: pointer;
+        font-size: 14px; color: #555; border-bottom: 2px solid transparent; margin-bottom: -1px;
+      }
+      .gemini-tab-button.active {
+        color: #4285F4; border-bottom-color: #4285F4; font-weight: 600;
+      }
+      .gemini-tab-content { display: none; }
+      .gemini-tab-content.active { display: block; }
       .gemini-preview-content {
         background-color: #f9f9f9; border: 1px solid #ddd; border-radius: 8px; padding: 15px;
         max-height: 400px; overflow-y: auto; text-align: left;
