@@ -1,0 +1,23 @@
+.gemini-button {
+    background-color: #F3F4F6; /* A light grey that matches Zendesk's UI */
+    color: #1F2937; /* Dark text color */
+    border: 1px solid #D1D5DB; /* A subtle border */
+    padding: 6px 14px;
+    border-radius: 5px;
+    cursor: pointer;
+    margin-left: 12px; /* Space it out from the "Public reply" dropdown */
+    font-family: inherit; /* Use Zendesk's font */
+    font-size: 14px;
+    font-weight: 600;
+    transition: background-color 0.2s ease-in-out;
+}
+
+.gemini-button:hover {
+    background-color: #E5E7EB; /* Slightly darker on hover */
+}
+
+.gemini-button:disabled {
+    background-color: #E5E7EB;
+    color: #6B7280;
+    cursor: not-allowed;
+}
