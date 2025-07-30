@@ -1,5 +1,5 @@
 // Chrome extension content script for Zendesk reply box grammar correction using Gemini API
-// -- FINAL VERSION with PREVIEW & HIGHLIGHTING --
+// -- FINAL VERSION v2: HIGHLIGHTING & FORMATTING PRESERVED --
 
 console.log("Gemini Assistant: Content script loaded.");
 
@@ -12,65 +12,80 @@ const ZENDESK_EDITOR_SELECTOR =
   "[data-test-id='omnicomposer-rich-text-ckeditor']";
 
 /**
- * A simple diffing utility to compare two strings and highlight differences.
- * This is a basic implementation for demonstration.
- * @param {string} oldStr The original string.
- * @param {string} newStr The new string.
- * @returns {string} An HTML string with additions highlighted.
+ * Compares original and corrected HTML to generate a new HTML string
+ * with all new words highlighted in green.
+ * @param {string} originalHtml The original HTML from the editor.
+ * @param {string} correctedHtml The corrected HTML from Gemini.
+ * @returns {string} A new HTML string for the preview with highlights.
  */
-function getHighlightedDiff(oldStr, newStr) {
-  // Basic cleanup to handle HTML tags by treating them as text
-  const cleanOld = oldStr
-    .replace(/<[^>]*>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  const cleanNew = newStr
-    .replace(/<[^>]*>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+function createHighlightedPreview(originalHtml, correctedHtml) {
+  const tempDiv = document.createElement("div");
 
-  const oldWords = cleanOld.split(" ");
-  const newWords = cleanNew.split(" ");
+  // Get a set of original words for quick lookup
+  tempDiv.innerHTML = originalHtml;
+  const oldWords = new Set(
+    (tempDiv.innerText || "").split(/\s+/).filter((w) => w.length > 0)
+  );
 
-  const newWordsSet = new Set(newWords);
-  let resultHtml = "";
+  // Get an array of new words
+  tempDiv.innerHTML = correctedHtml;
+  const newText = tempDiv.innerText || "";
 
-  for (const word of newWords) {
-    if (!new Set(oldWords).has(word)) {
-      resultHtml += `<span class="gemini-highlight">${word}</span> `;
-    } else {
-      resultHtml += `${word} `;
-    }
+  // Find words that are in the new text but not the old one
+  const addedWords = new Set(
+    newText.split(/\s+/).filter((word) => !oldWords.has(word))
+  );
+
+  if (addedWords.size === 0) {
+    return correctedHtml; // No changes to highlight
   }
-  return `<p>${resultHtml.trim()}</p>`;
+
+  let highlightedHtml = correctedHtml;
+
+  // Wrap each unique new word with a highlight span
+  addedWords.forEach((word) => {
+    // Use a Regex to replace the word only when it's not part of an HTML tag.
+    // This looks for the word surrounded by boundaries (\b) and ensures it's not inside a tag.
+    const regex = new RegExp(`\\b(${escapeRegExp(word)})\\b`, "gi");
+    highlightedHtml = highlightedHtml.replace(
+      regex,
+      `<span class="gemini-highlight">$1</span>`
+    );
+  });
+
+  return highlightedHtml;
+}
+
+// Utility to escape strings for use in a Regular Expression
+function escapeRegExp(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
- * Shows a modal preview box with the highlighted changes.
- * @param {string} originalText The original plain text.
- * @param {string} correctedHtml The corrected HTML from Gemini.
+ * Shows a modal preview box.
+ * @param {string} previewHtml The HTML with highlights to display.
+ * @param {string} cleanCopyToClipboardHtml The non-highlighted HTML to be copied.
  * @param {HTMLElement} mainButton The main "Correct" button on the page.
  * @param {HTMLElement} editorElem The editor element to focus on paste.
  */
-function showPreviewBox(originalText, correctedHtml, mainButton, editorElem) {
-  // Remove any existing preview box
+function showPreviewBox(
+  previewHtml,
+  cleanCopyToClipboardHtml,
+  mainButton,
+  editorElem
+) {
   const existingOverlay = document.getElementById("gemini-preview-overlay");
   if (existingOverlay) existingOverlay.remove();
 
-  // Create overlay
   const overlay = document.createElement("div");
   overlay.id = "gemini-preview-overlay";
 
-  // Create preview box
   const previewBox = document.createElement("div");
   previewBox.id = "gemini-preview-box";
 
-  // Generate highlighted diff HTML
-  const diffHtml = getHighlightedDiff(originalText, correctedHtml);
-
   previewBox.innerHTML = `
         <h3>Correction Preview</h3>
-        <div class="gemini-preview-content">${diffHtml}</div>
+        <div class="gemini-preview-content">${previewHtml}</div>
         <div class="gemini-preview-actions">
             <button id="gemini-cancel-btn">Cancel</button>
             <button id="gemini-accept-btn">Accept & Copy</button>
@@ -80,16 +95,20 @@ function showPreviewBox(originalText, correctedHtml, mainButton, editorElem) {
   overlay.appendChild(previewBox);
   document.body.appendChild(overlay);
 
-  // Add event listeners
-  document.getElementById("gemini-cancel-btn").onclick = () => {
-    overlay.remove();
+  const resetMainButton = () => {
     mainButton.textContent = "✨ Correct";
     mainButton.disabled = false;
+    mainButton.classList.remove("ready-to-paste");
+  };
+
+  document.getElementById("gemini-cancel-btn").onclick = () => {
+    overlay.remove();
+    resetMainButton();
   };
 
   document.getElementById("gemini-accept-btn").onclick = async () => {
     try {
-      const blob = new Blob([correctedHtml], { type: "text/html" });
+      const blob = new Blob([cleanCopyToClipboardHtml], { type: "text/html" });
       const clipboardItem = new ClipboardItem({ "text/html": blob });
       await navigator.clipboard.write([clipboardItem]);
 
@@ -103,20 +122,20 @@ function showPreviewBox(originalText, correctedHtml, mainButton, editorElem) {
     } catch (err) {
       console.error("Gemini Assistant: Failed to copy to clipboard.", err);
       alert("Failed to copy text. Please try again.");
+      resetMainButton();
     }
   };
 }
 
 /**
- * Sends text to the Gemini API for correction.
- * @param {string} text The plain text to correct.
- * @returns {Promise<string>} A promise that resolves to the corrected text as an HTML string.
+ * Sends HTML to the Gemini API for correction while preserving structure.
+ * @param {string} html The original HTML content from the editor.
+ * @returns {Promise<string>} A promise that resolves to the corrected HTML string.
  */
-async function correctWithGemini(text) {
-  if (!text || !text.trim()) {
-    return "";
-  }
-  const prompt = `You are a helpful grammar correction assistant. Rewrite the following text to fix all grammar, spelling, and clarity issues. IMPORTANT: Your entire response must consist of ONLY the corrected text as a raw HTML string. Wrap each paragraph in <p> tags. Do NOT include "\`\`\`html", "\`\`\`", or any other markdown formatting in your response. Original Text: "${text}"`;
+async function correctWithGemini(html) {
+  if (!html || !html.trim()) return "";
+
+  const prompt = `You are a helpful grammar correction assistant. Below is a piece of HTML from a rich text editor. Correct the grammar and spelling of the text within the HTML tags. IMPORTANT: - Preserve the original HTML structure, including all <p> tags. - Your entire response must be only the corrected, raw HTML string. - Do NOT add any markdown like "\`\`\`html". Original HTML: --- ${html} ---`;
 
   try {
     const response = await fetch(`${GEMINI_API_URL}?key=${API_KEY}`, {
@@ -141,13 +160,53 @@ async function correctWithGemini(text) {
         "Gemini Assistant: Received an invalid or empty response from the API.",
         JSON.stringify(data)
       );
-      return `<p>${text.replace(/\n/g, "</p><p>")}</p>`;
+      return html;
     }
   } catch (error) {
     console.error("Gemini Assistant: Exception while contacting API.", error);
     alert("Error contacting Gemini API. Check the console for details.");
-    return `<p>${text.replace(/\n/g, "</p><p>")}</p>`;
+    return html;
   }
+}
+
+/**
+ * Main button click handler.
+ * @param {Event} e The click event.
+ * @param {HTMLElement} btn The button that was clicked.
+ * @param {HTMLElement} editorElem The editor element.
+ */
+async function onCorrectButtonClick(e, btn, editorElem) {
+  e.preventDefault();
+  e.stopPropagation();
+
+  const originalButtonText = "✨ Correct";
+
+  if (btn.classList.contains("ready-to-paste")) {
+    btn.textContent = originalButtonText;
+    btn.classList.remove("ready-to-paste");
+    return;
+  }
+
+  btn.textContent = "⏳ Correcting...";
+  btn.disabled = true;
+
+  const htmlToCorrect = editorElem.innerHTML;
+  const correctedHtml = await correctWithGemini(htmlToCorrect);
+
+  if (correctedHtml === htmlToCorrect) {
+    btn.textContent = "No Changes Needed";
+    setTimeout(() => {
+      btn.textContent = originalButtonText;
+      btn.disabled = false;
+    }, 2000);
+    return;
+  }
+
+  // Generate the special version of the HTML for the preview
+  const previewHtml = createHighlightedPreview(htmlToCorrect, correctedHtml);
+
+  // Show the preview, passing both the preview and the clean versions
+  showPreviewBox(previewHtml, correctedHtml, btn, editorElem);
 }
 
 /**
@@ -170,31 +229,11 @@ function addGeminiButton(editorElem) {
   btn.className = "gemini-correct-btn";
   container.appendChild(btn);
 
-  let originalButtonText = "✨ Correct";
-
-  btn.onclick = async (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-
-    if (btn.classList.contains("ready-to-paste")) {
-      btn.textContent = originalButtonText;
-      btn.classList.remove("ready-to-paste");
-      return;
-    }
-
-    btn.textContent = "⏳ Correcting...";
-    btn.disabled = true;
-
-    const textToCorrect = editorElem.innerText;
-    const correctedHtml = await correctWithGemini(textToCorrect);
-
-    // Show the preview box instead of copying directly
-    showPreviewBox(textToCorrect, correctedHtml, btn, editorElem);
-  };
+  btn.onclick = (e) => onCorrectButtonClick(e, btn, editorElem);
 
   editorElem.addEventListener("focus", () => {
     if (btn.classList.contains("ready-to-paste")) {
-      btn.textContent = originalButtonText;
+      btn.textContent = "✨ Correct";
       btn.classList.remove("ready-to-paste");
     }
   });
@@ -209,72 +248,50 @@ function addGlobalStyles() {
   style.id = "gemini-style-injector";
   style.textContent = `
       .gemini-correct-btn {
-        position: absolute; bottom: 8px; right: 8px; z-index: 10000;
-        font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-        background-color: #4285F4; color: white; border: none; border-radius: 8px;
-        padding: 6px 14px; cursor: pointer; opacity: 0.9;
+        position: absolute; bottom: 8px; right: 8px; z-index: 10000; font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        background-color: #4285F4; color: white; border: none; border-radius: 8px; padding: 6px 14px; cursor: pointer; opacity: 0.9;
         transition: all 0.2s; box-shadow: 0 1px 3px rgba(0,0,0,0.1);
       }
       .gemini-correct-btn:hover { opacity: 1; box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
       .gemini-correct-btn:disabled { background-color: #BDBDBD; cursor: not-allowed; }
       .gemini-correct-btn.ready-to-paste { background-color: #34A853; }
-
       #gemini-preview-overlay {
-        position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-        background-color: rgba(0, 0, 0, 0.6); z-index: 99998;
+        position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.6); z-index: 99998;
         display: flex; align-items: center; justify-content: center;
       }
       #gemini-preview-box {
-        background-color: white; border-radius: 12px;
-        box-shadow: 0 5px 15px rgba(0,0,0,0.3);
-        width: 90%; max-width: 600px;
-        padding: 20px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-        z-index: 99999;
+        background-color: white; border-radius: 12px; box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+        width: 90%; max-width: 600px; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        z-index: 99999; text-align: left;
       }
-      #gemini-preview-box h3 {
-        margin-top: 0; color: #333;
-      }
+      #gemini-preview-box h3 { margin-top: 0; color: #333; }
       .gemini-preview-content {
-        background-color: #f9f9f9; border: 1px solid #ddd;
-        border-radius: 8px; padding: 15px;
-        max-height: 400px; overflow-y: auto;
-        line-height: 1.6;
+        background-color: #f9f9f9; border: 1px solid #ddd; border-radius: 8px; padding: 15px;
+        max-height: 400px; overflow-y: auto; text-align: left;
       }
+      .gemini-preview-content p { margin-top: 0; margin-bottom: 1em; line-height: 1.6; }
+      .gemini-preview-content p:last-child { margin-bottom: 0; }
       .gemini-highlight {
-        background-color: #d4edda; /* Light green */
-        color: #155724; /* Dark green */
-        padding: 2px 4px; border-radius: 4px;
-        font-weight: bold;
+        background-color: #d4edda; color: #155724; padding: 1px 3px; border-radius: 3px; font-weight: 500;
       }
-      .gemini-preview-actions {
-        margin-top: 20px; text-align: right;
-      }
+      .gemini-preview-actions { margin-top: 20px; text-align: right; }
       .gemini-preview-actions button {
-        padding: 10px 20px; border-radius: 8px; border: none;
-        cursor: pointer; font-weight: bold;
-        transition: background-color 0.2s;
+        padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer; font-weight: bold; transition: background-color 0.2s;
       }
-      #gemini-cancel-btn {
-        background-color: #eee; color: #333; margin-right: 10px;
-      }
+      #gemini-cancel-btn { background-color: #eee; color: #333; margin-right: 10px; }
       #gemini-cancel-btn:hover { background-color: #ddd; }
-      #gemini-accept-btn {
-        background-color: #4285F4; color: white;
-      }
+      #gemini-accept-btn { background-color: #4285F4; color: white; }
       #gemini-accept-btn:hover { background-color: #3367D6; }
     `;
   document.head.appendChild(style);
 }
 
-/**
- * Main function that finds and enhances all editors on the page.
- */
-function findAndEnhanceEditors() {
-  document.querySelectorAll(ZENDESK_EDITOR_SELECTOR).forEach(addGeminiButton);
-}
-
 // --- SCRIPT EXECUTION ---
 addGlobalStyles();
-const observer = new MutationObserver(findAndEnhanceEditors);
+const observer = new MutationObserver(() =>
+  document.querySelectorAll(ZENDESK_EDITOR_SELECTOR).forEach(addGeminiButton)
+);
 observer.observe(document.body, { childList: true, subtree: true });
-window.addEventListener("load", findAndEnhanceEditors);
+window.addEventListener("load", () =>
+  document.querySelectorAll(ZENDESK_EDITOR_SELECTOR).forEach(addGeminiButton)
+);
